@@ -104,6 +104,10 @@
     color:#ffd45d;
     font-weight:800;
   }
+  .v.ft-ok{color:#35d0c0!important;font-weight:800;}
+  .v.ft-warning{color:#f5a623!important;font-weight:800;}
+  .v.ft-expired{color:#ff5470!important;font-weight:800;}
+  .v.ft-neutral{color:var(--text-muted)!important;}
 </style>
   <meta name="theme-color" content="#111827">
   <meta name="description" content="Visualizador 3D de pátio de containers com importação de CSV.">
@@ -144,7 +148,7 @@
 </div>
 
 <div class="hud" id="search-box">
-  <input id="search-input" type="text" placeholder="MSKU1234567 ou PT1-CT-A-01" autocomplete="off">
+  <input id="search-input" type="text" placeholder="Container ou endereço (todos os pátios)" autocomplete="off">
   <button id="search-btn">Localizar</button>
   <span id="search-msg"></span>
 </div>
@@ -981,25 +985,96 @@
     const totalRuas=zones.reduce((s,z)=>s+z.ruas.length,0);
 
     document.getElementById("title-sub").textContent=
-      `${activePatioId}-${areaId} · ${totalRuas} ruas · ${totalBoxes} posições · até ${cfg.maxTiers} andares`;
+      `${activePatioId}-${areaId} · ${totalRuas} ruas · ${totalBoxes} posições · layout físico por tamanho`;
   }
 
   /* =========================================================
      SINCRONIZAÇÃO: dados (yardData) -> malha 3D visível
      ========================================================= */
   function rebuildBayMeshes(bay){
-    while(bay.contentGroup.children.length){ const ch=bay.contentGroup.children[0]; disposeGroup(ch); bay.contentGroup.remove(ch); }
+    while(bay.contentGroup.children.length){
+      const ch=bay.contentGroup.children[0];
+      disposeGroup(ch);
+      bay.contentGroup.remove(ch);
+    }
+
     if(bay.stack.length>0){
-      let y=0;
-      bay.stack.forEach((c,i) => {
-        const typeDef = CONTAINER_TYPES[c.typeCode] || CONTAINER_TYPES["40DC"], carrier = CARRIERS[c.carrierCode] || CARRIERS.OTHER;
-        const grp = buildContainerGroup(typeDef, carrier, c.plate, c.client);
-        grp.position.set(bay.x, y, bay.z);
-        grp.rotation.y = bay.containerRotation===90 ? Math.PI/2 : 0;
-        bay.contentGroup.add(grp);
-        c.mesh = grp; c.tier = i+1;
-        y += typeDef.height + 0.04;
+      /*
+        Regra física para containers de 20':
+        WMS altura 1 e 2  -> mesmo nível, lado a lado
+        WMS altura 3 e 4  -> nível seguinte, lado a lado
+        WMS altura 5 e 6  -> próximo nível, etc.
+
+        Containers de 40'/45' continuam usando a altura WMS como andar
+        e ficam centralizados no box.
+      */
+      const placements = bay.stack.map((c, index) => {
+        const typeDef = CONTAINER_TYPES[c.typeCode] || CONTAINER_TYPES["40DC"];
+        const wmsPos = Math.max(1, Number(c._altura || c.tier || index + 1));
+
+        let visualLevel = wmsPos;
+        let side = 0; // 0=center, -1=primeira metade, +1=segunda metade
+
+        if(typeDef.sizeClass === "20"){
+          visualLevel = Math.ceil(wmsPos / 2);
+          side = (wmsPos % 2 === 1) ? -1 : 1;
+        }
+
+        return { c, typeDef, wmsPos, visualLevel, side };
       });
+
+      // Altura de cada nível físico. Usa o container mais alto daquele nível.
+      const levelHeights = new Map();
+      placements.forEach(p => {
+        levelHeights.set(
+          p.visualLevel,
+          Math.max(levelHeights.get(p.visualLevel) || 0, p.typeDef.height)
+        );
+      });
+
+      // Calcula a base Y de cada nível para que os níveis não se sobreponham.
+      const maxLevel = Math.max(...placements.map(p => p.visualLevel), 1);
+      const levelBaseY = new Map();
+      let yCursor = 0;
+      for(let level=1; level<=maxLevel; level++){
+        levelBaseY.set(level, yCursor);
+        if(levelHeights.has(level)){
+          yCursor += levelHeights.get(level) + 0.04;
+        }
+      }
+
+      const HALF_20_OFFSET = 3.08; // ~ metade de um slot de 40', com pequeno vão central
+
+      placements.forEach(p => {
+        const carrier = CARRIERS[p.c.carrierCode] || CARRIERS.OTHER;
+        const grp = buildContainerGroup(p.typeDef, carrier, p.c.plate, p.c.client);
+
+        let x = bay.x;
+        let z = bay.z;
+
+        if(p.typeDef.sizeClass === "20"){
+          // O eixo longo muda conforme a orientação física do box.
+          if(bay.containerRotation === 90){
+            z += p.side * HALF_20_OFFSET;
+          }else{
+            x += p.side * HALF_20_OFFSET;
+          }
+        }
+
+        grp.position.set(x, levelBaseY.get(p.visualLevel) || 0, z);
+        grp.rotation.y = bay.containerRotation===90 ? Math.PI/2 : 0;
+
+        bay.contentGroup.add(grp);
+
+        p.c.mesh = grp;
+        p.c.tier = p.visualLevel;
+        p.c.visualTier = p.visualLevel;
+        p.c.wmsTier = p.wmsPos;
+        p.c.visualSide = p.typeDef.sizeClass === "20"
+          ? (p.side < 0 ? "A" : "B")
+          : null;
+      });
+
       bay.padLine.material.color.setHex(STATUS_COLOR.occupied);
       bay.labelPlane.visible = false;
     } else {
@@ -1105,17 +1180,26 @@
     for(let i=bay.stack.length-1;i>=0;i--){
       const c = bay.stack[i];
       const typeDef = CONTAINER_TYPES[c.typeCode] || CONTAINER_TYPES["40DC"], carrier = CARRIERS[c.carrierCode] || CARRIERS.OTHER;
-      const isTop = (i === bay.stack.length-1);
+      const physicalTier = c.visualTier || c.tier || (i+1);
+      const is20 = typeDef.sizeClass === "20";
+      const positionLabel = is20
+        ? `NÍVEL ${physicalTier} · LADO ${c.visualSide || "—"}`
+        : `ANDAR ${physicalTier}`;
+      const ft = freeTimeStatus(c.entryDateObj || parseEntryDate(c.entryDate), c.freeTimeDays);
       html += `
         <div class="container-card">
-          <div class="tier-tag"><span>ANDAR ${i+1}</span><span>${isTop?"topo":"sob carga"}</span></div>
+          <div class="tier-tag"><span>${positionLabel}</span><span>WMS ${c.wmsTier || c._altura || i+1}</span></div>
           <div class="field"><span class="k">Placa</span><span class="v plate">${c.plate}</span></div>
           <div class="field"><span class="k">Tipo</span><span class="v">${typeDef.code} · ${typeDef.label}</span></div>
           <div class="field"><span class="k">ID_ARTIKEL</span><span class="v">${c.artikel || "—"}</span></div>
           <div class="field"><span class="k">Armador</span><span class="v">${carrier.name}</span></div>\n          <div class="field"><span class="k">Prefixo</span><span class="v">${(c.plate||"").substring(0,4)}</span></div>
           <div class="field"><span class="k">Transportadora</span><span class="v">${((c.client||"").trim().toUpperCase()==="MEXPRESS") ? "★ MEXPRESS" : (c.client || "—")}</span></div>
-          <div class="field"><span class="k">Peso</span><span class="v">${c.weight.toLocaleString("pt-BR")} kg</span></div>
+          <div class="field"><span class="k">Peso informado</span><span class="v">${c.weight?formatKg(c.weight):"—"}</span></div>
           <div class="field"><span class="k">Entrada</span><span class="v">${c.entryDate}</span></div>
+          <div class="field"><span class="k">Tempo no pátio</span><span class="v">${ft.patioDays===null?"—":ft.patioDays+" dia(s)"}</span></div>
+          <div class="field"><span class="k">Tara</span><span class="v">${formatKg(c.tara)}</span></div>
+          <div class="field"><span class="k">Free time</span><span class="v">${c.freeTimeDays===null?"—":Math.trunc(c.freeTimeDays)+" dia(s)"}</span></div>
+          <div class="field"><span class="k">Situação free time</span><span class="v ft-${ft.state}">${ft.label}</span></div>
         </div>`;
     }
     return html;
@@ -1257,10 +1341,25 @@
     if(parts.length===5) return {patio:parts[0],area:parts[1],rua:parts[2],box:parseInt(parts[3],10),altura:parseInt(parts[4],10)};
     return null;
   }
-  function findByPlate(query){
-    for(const bay of bays){ if(bay.stack.some(c => normalize(c.plate)===query)) return bay; }
+  function findByPlateGlobal(query){
+    for(const patioId of Object.keys(yardData)){
+      const patioData = yardData[patioId] || {};
+      for(const [key, stack] of Object.entries(patioData)){
+        const found = (stack || []).find(c => normalize(c.plate) === query);
+        if(found){
+          const [rua, boxRaw] = key.split("|");
+          return {
+            patioId,
+            rua,
+            box: parseInt(boxRaw,10),
+            container: found
+          };
+        }
+      }
+    }
     return null;
   }
+
   function findByAddress(raw){
     const parts = parseAddressParts(raw);
     if(!parts) return null;
@@ -1274,12 +1373,35 @@
     const raw = searchInput.value;
     const q = normalize(raw);
     if(!q){ searchMsg.textContent=""; return; }
-    let bay = findByPlate(q) || findByAddress(raw);
-    if(bay){
+
+    const plateResult = findByPlateGlobal(q);
+
+    if(plateResult){
+      if(plateResult.patioId !== activePatioId){
+        switchPatio(plateResult.patioId);
+        patioSelect.value = plateResult.patioId;
+      }
+
+      const bay = bays.find(
+        b => b.rua.toUpperCase() === plateResult.rua.toUpperCase()
+          && b.box === plateResult.box
+      );
+
+      if(bay){
+        searchMsg.textContent = "";
+        focusPoint(bay.x, bay.z);
+        renderInfoPanel(bay);
+        flashBay(bay);
+        return;
+      }
+    }
+
+    const bayByAddress = findByAddress(raw);
+    if(bayByAddress){
       searchMsg.textContent = "";
-      focusPoint(bay.x, bay.z);
-      renderInfoPanel(bay);
-      flashBay(bay);
+      focusPoint(bayByAddress.x, bayByAddress.z);
+      renderInfoPanel(bayByAddress);
+      flashBay(bayByAddress);
     } else {
       searchMsg.textContent = "não encontrado";
     }
@@ -1369,6 +1491,50 @@
     return PREFIX_TO_CARRIER[prefix] || "OTHER";
   }
 
+  function parseNumberFlexible(raw){
+    if(raw===null || raw===undefined) return null;
+    let s=String(raw).trim();
+    if(!s) return null;
+    if(s.includes(",") && s.includes(".")) s=s.replace(/\./g,"").replace(",",".");
+    else if(s.includes(",")) s=s.replace(",",".");
+    s=s.replace(/[^\d.-]/g,"");
+    const n=Number(s);
+    return Number.isFinite(n)?n:null;
+  }
+
+  function parseEntryDate(raw){
+    const s=(raw||"").toString().trim();
+    if(!s) return null;
+    let m=s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+    if(m){
+      const d=new Date(Number(m[3]),Number(m[2])-1,Number(m[1]),Number(m[4]||0),Number(m[5]||0),Number(m[6]||0));
+      return Number.isNaN(d.getTime())?null:d;
+    }
+    const d=new Date(s);
+    return Number.isNaN(d.getTime())?null:d;
+  }
+
+  function daysInYard(entryDate){
+    if(!entryDate) return null;
+    const diff=Date.now()-entryDate.getTime();
+    if(diff<0) return 0;
+    return Math.floor(diff/86400000);
+  }
+
+  function freeTimeStatus(entryDate, freeTimeDays){
+    const patioDays=daysInYard(entryDate);
+    if(patioDays===null || freeTimeDays===null) return {patioDays,remaining:null,label:"Não informado",state:"neutral"};
+    const remaining=Math.trunc(freeTimeDays)-patioDays;
+    if(remaining>0) return {patioDays,remaining,label:`${remaining} dia(s) restante(s)`,state:"ok"};
+    if(remaining===0) return {patioDays,remaining,label:"Último dia de free time",state:"warning"};
+    return {patioDays,remaining,label:`${Math.abs(remaining)} dia(s) excedido(s)`,state:"expired"};
+  }
+
+  function formatKg(value){
+    if(value===null || value===undefined || !Number.isFinite(Number(value))) return "—";
+    return `${Number(value).toLocaleString("pt-BR",{maximumFractionDigits:2})} kg`;
+  }
+
   function parseWmsAddress(raw){
     const parts=(raw||"").trim().toUpperCase().split("-").filter(Boolean);
     if(parts.length < 3) return null;
@@ -1455,7 +1621,7 @@
       if(seenContainers.has(placa)) return;
       seenContainers.add(placa);
 
-      const peso=0;
+      const peso=parseNumberFlexible(raw.peso_kg || raw.peso || raw.peso_bruto) || 0;
       const dataEntrada=(raw.data_entrada_ge100||"").trim() || "—";
       arr.push({
         plate:placa,
@@ -1464,6 +1630,9 @@
         client,
         weight:peso,
         entryDate:dataEntrada,
+        entryDateObj:parseEntryDate(dataEntrada),
+        tara:parseNumberFlexible(raw.tara),
+        freeTimeDays:parseNumberFlexible(raw.free_time || raw.freetime || raw.free_time_dias || raw.dias_free_time),
         artikel:(raw.id_artikel||"").trim().toUpperCase(),
         tier:addr.altura,
         mesh:null,
@@ -1518,9 +1687,9 @@
   });
   document.getElementById("template-btn").onclick = () => {
     const csv = [
-      "DATA_ENTRADA_GE100;CONTAINER;TRANSPORTADORA;ID_ARTIKEL;ORT;BEREICH;PLATZ",
-      "29/05/2026 07:14:00;SIMU2508800;SIRIUS;CONT_ISOT_20;PT3;CT;A-02-1",
-      "12/06/2026 02:30:45;SIMU2658013;SIRIUS;CONT_NORM_20;PT3;CT;A-02-2",
+      "DATA_ENTRADA_GE100;CONTAINER;TRANSPORTADORA;ID_ARTIKEL;ORT;BEREICH;PLATZ;TARA;FREE_TIME",
+      "29/05/2026 07:14:00;SIMU2508800;SIRIUS;CONT_ISOT_20;PT3;CT;A-02-1;3650;10",
+      "12/06/2026 02:30:45;SIMU2658013;SIRIUS;CONT_NORM_20;PT3;CT;A-02-2;2250;7",
       "01/07/2026 21:39:03;MSKU1943370;GLOBALL;CONT_JUMB_40;PT2;CT;E-01-1"
     ].join("\n");
     const blob = new Blob(["\ufeff"+csv], {type:"text/csv;charset=utf-8"});
